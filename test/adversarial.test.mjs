@@ -1,0 +1,353 @@
+// Mirror note: tests that need a signed Pro key are skipped here. The signing key
+// lives only in the monorepo (keys/license-private.pem); run them there.
+// What a wrong, hostile or impossible input does. Every case here is a refusal that
+// names the problem and writes nothing, or a defensible answer stated in words.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { client, sandbox, cleanup, proKey, storeDir, WORKED } from "./_client.mjs";
+import {
+  buildSchedule, repayEarly, scheduleIsExact, validateTerms, effectiveAnnualRate, periodicRate,
+} from "../dist/lib.js";
+
+function open(t, opts = {}) {
+  const box = sandbox();
+  const c = client({ dataHome: box.dataHome, ...opts });
+  t.after(() => { c.close(); cleanup(box.dir); });
+  return { box, c };
+}
+
+const terms = (over = {}) => ({
+  principal_minor: 1000000, currency: "EUR", rate_bps: 1200, compounding: "monthly",
+  payment_frequency: "monthly", term_periods: 12, method: "annuity",
+  start_date: "2026-01-15", fees_minor: 0, balloon_minor: 0, ...over,
+});
+
+test("a term of zero periods is refused, in the engine and at the tool", async (t) => {
+  assert.throws(() => validateTerms(terms({ term_periods: 0 })), /term must be at least 1 period/);
+  const { c } = open(t);
+  await c.init();
+  const r = await c.call("loan_create", { ...WORKED, term_periods: 0 });
+  assert.equal(r.isError, true);
+  const { c: c2 } = open(t);
+  await c2.init();
+  assert.equal((await c2.json("loan_list", {})).count, 0, "nothing was written");
+});
+
+test("a negative or zero principal is refused and never stored", async (t) => {
+  assert.throws(() => validateTerms(terms({ principal_minor: -1 })), /principal must be a whole number of minor units above zero/);
+  assert.throws(() => validateTerms(terms({ principal_minor: 0 })), /above zero/);
+  assert.throws(() => validateTerms(terms({ principal_minor: 100.5 })), /whole number/);
+  const { box, c } = open(t);
+  await c.init();
+  assert.equal((await c.call("loan_create", { ...WORKED, principal_minor: -1000 })).isError, true);
+  assert.equal((await c.json("loan_list", {})).count, 0);
+  assert.equal(existsSync(join(storeDir(box.dataHome), "loans.json")), false, "no register file was even created");
+});
+
+test("a rate over 100 percent is a real rate, not an error, and it is charged as one", async (t) => {
+  // 12,000 basis points is 120 percent nominal, compounded monthly: 10 percent a month.
+  // Its effective annual rate is 1.1^12 - 1 = 213.84 percent, and that gap is the point.
+  const { c } = open(t);
+  await c.init();
+  const r = await c.json("loan_create", { ...WORKED, rate_bps: 12000, name: "Payday" });
+  assert.equal(r.created.effective_annual_rate_pct, "213.84");
+  assert.equal(r.periodic_rate_pct, "10.000000");
+  const s = await c.json("loan_schedule", { loan: r.created.id });
+  assert.equal(s.rows[0].interest_minor, 100000);
+  assert.equal(s.rows[11].closing_minor, 0);
+  assert.ok(s.total_interest_minor > 0);
+  // And the ceiling above it still refuses: 1,000,001 basis points is a typo, not a loan.
+  assert.equal((await c.call("loan_create", { ...WORKED, rate_bps: 100000000 })).isError, true);
+});
+
+test("a balloon that is the whole principal, and fees that are the whole principal, are refused", async (t) => {
+  assert.throws(() => validateTerms(terms({ balloon_minor: 1000000 })), /balloon 1000000 is not less than the principal/);
+  assert.throws(() => validateTerms(terms({ fees_minor: 1000000 })), /fees 1000000 are not less than the principal/);
+  const { c } = open(t);
+  await c.init();
+  const r = await c.call("loan_create", { ...WORKED, balloon_minor: 1000000 });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /amortises nothing/);
+});
+
+test.skip("repaying after the end of the loan is refused by name", async (t) => {
+  const { c } = open(t, { key: proKey() });
+  await c.init();
+  const made = await c.json("loan_create", WORKED);
+  const r = await c.call("loan_repay_early", { loan: made.created.id, as_of_period: 13 });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /past the end of a 12 period loan/);
+  // The last period is allowed: settling at period 12 owes nothing and saves nothing.
+  const last = await c.json("loan_repay_early", { loan: made.created.id, as_of_period: 12 });
+  assert.equal(last.outstanding_minor, 0);
+  assert.equal(last.interest_saved_minor, 0);
+  assert.equal(last.periods_cancelled, 0);
+});
+
+test.skip("a date that is not a date, and a month that is not a month, are refused", async (t) => {
+  const { c } = open(t, { key: proKey() });
+  await c.init();
+  for (const bad of ["2026-02-30", "yesterday", "15-01-2026", ""]) {
+    const r = await c.call("loan_create", { ...WORKED, start_date: bad });
+    assert.equal(r.isError, true, `start_date ${JSON.stringify(bad)} was accepted`);
+  }
+  const made = await c.json("loan_create", WORKED);
+  const m = await c.call("loan_journal", { loan: made.created.id, month: "2026-13" });
+  assert.equal(m.isError, true);
+  assert.match(m.text, /is not a month in YYYY-MM form/);
+});
+
+test.skip("a journal asked for both a period and a month, or for neither, is refused", async (t) => {
+  const { c } = open(t, { key: proKey() });
+  await c.init();
+  const made = await c.json("loan_create", WORKED);
+  for (const args of [{}, { period: 1, month: "2026-02" }]) {
+    const r = await c.call("loan_journal", { loan: made.created.id, ...args });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /exactly one of period or month/);
+  }
+});
+
+test.skip("an unreadable register is never read as an empty one", async (t) => {
+  const { box, c } = open(t, { key: proKey() });
+  await c.init();
+  await c.call("loan_create", WORKED);
+  c.close();
+  const file = join(storeDir(box.dataHome), "loans.json");
+  writeFileSync(file, "{ this is not json");
+  const c2 = client({ dataHome: box.dataHome, key: proKey() });
+  t.after(() => c2.close());
+  await c2.init();
+  for (const [tool, args] of [["loan_list", {}], ["loan_schedule", { loan: "LOAN-2026-0001" }], ["loans_report", {}]]) {
+    const r = await c2.call(tool, args);
+    assert.equal(r.isError, true, `${tool} answered over a corrupt register`);
+  }
+  const quarantined = readdirSync(storeDir(box.dataHome)).filter((f) => f.includes("corrupt"));
+  assert.ok(quarantined.length >= 1, `nothing was quarantined: ${quarantined.join(", ")}`);
+  assert.equal(readFileSync(join(storeDir(box.dataHome), quarantined.find((f) => !f.endsWith(".corrupt"))), "utf8"), "{ this is not json",
+    "the corrupt bytes are kept verbatim");
+});
+
+test("the free tier holds three loans, and every schedule stays free", async (t) => {
+  const { c } = open(t);
+  await c.init();
+  for (let n = 1; n <= 3; n++) {
+    const r = await c.call("loan_create", { ...WORKED, name: `Loan ${n}` });
+    assert.equal(r.isError, false, `loan ${n} was refused`);
+  }
+  const fourth = await c.call("loan_create", { ...WORKED, name: "Loan 4" });
+  assert.equal(fourth.isError, true);
+  assert.match(fourth.text, /the free tier holds 3 loans/);
+  assert.match(fourth.text, /Pro is a one-time \$\d+ for this server/);
+  assert.equal((await c.json("loan_list", {})).count, 3, "the refused loan was not written");
+  // Schedules are never metered: three loans, six schedule calls, no refusal.
+  for (const id of ["LOAN-2026-0001", "LOAN-2026-0002", "LOAN-2026-0003"]) {
+    assert.equal((await c.call("loan_schedule", { loan: id })).isError, false);
+    assert.equal((await c.call("loan_schedule", { loan: id })).isError, false);
+  }
+});
+
+test.skip("a Pro key signed for another product unlocks nothing here", async (t) => {
+  const { c } = open(t, { key: proKey("deposits") });
+  await c.init();
+  await c.call("loan_create", WORKED);
+  const r = await c.call("loans_report", {});
+  assert.equal(r.isError, true);
+  assert.match(r.text, /loans_report is Pro/);
+});
+
+test("an ambiguous name is refused with the candidates rather than resolved to the first", async (t) => {
+  const { c } = open(t);
+  await c.init();
+  await c.call("loan_create", { ...WORKED, name: "Van finance A" });
+  await c.call("loan_create", { ...WORKED, name: "Van finance B" });
+  const r = await c.call("loan_schedule", { loan: "Van finance" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /matches more than one loan/);
+  assert.match(r.text, /LOAN-2026-0001/);
+  assert.equal((await c.call("loan_schedule", { loan: "Van finance A" })).isError, false);
+});
+
+test("a loan that does not exist is refused and never invented", async (t) => {
+  const { c } = open(t);
+  await c.init();
+  const r = await c.call("loan_schedule", { loan: "LOAN-1999-0001" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /no loan matches "LOAN-1999-0001"/);
+});
+
+test("every schedule the engine can build closes exactly on its balloon", () => {
+  // A sweep, not an example: 6 rates x 5 terms x 2 methods x 3 balloons x 4 frequencies.
+  let built = 0;
+  for (const rate_bps of [0, 1, 250, 1200, 4999, 12000]) {
+    for (const term_periods of [1, 2, 7, 60, 360]) {
+      for (const method of ["annuity", "straight-principal"]) {
+        for (const balloon_minor of [0, 1, 333333]) {
+          for (const payment_frequency of ["weekly", "monthly", "quarterly", "annual"]) {
+            const t = terms({ rate_bps, term_periods, method, balloon_minor, payment_frequency });
+            const s = buildSchedule(t);
+            built++;
+            assert.equal(scheduleIsExact(t, s), true,
+              `${method} ${rate_bps}bps x${term_periods} ${payment_frequency} balloon ${balloon_minor} does not close`);
+            assert.ok(s.rows.length >= 1 && s.rows.length <= term_periods, `${s.rows.length} rows for a ${term_periods} period term`);
+            assert.ok(s.rows.every((r) => r.interest_minor >= 0), "an interest charge is never negative");
+          }
+        }
+      }
+    }
+  }
+  assert.equal(built, 6 * 5 * 2 * 3 * 4);
+});
+
+test("an early settlement of every period of every schedule reconciles with the schedule itself", () => {
+  const t = terms();
+  const s = buildSchedule(t);
+  for (let p = 1; p <= 12; p++) {
+    const r = repayEarly(t, s, p, { penalty_minor: 0 });
+    assert.equal(r.interest_paid_minor + r.interest_saved_minor, s.total_interest_minor, `period ${p}`);
+    assert.equal(r.outstanding_minor, s.rows[p - 1].closing_minor);
+  }
+  assert.throws(() => repayEarly(t, s, 0), /as_of_period must be a whole period of 1 or more/);
+  assert.throws(() => repayEarly(t, s, 3, { penalty_minor: -1 }), /penalty must be a whole number/);
+});
+
+test("the rate arithmetic on the edges", () => {
+  assert.equal(effectiveAnnualRate(0, "monthly"), 0);
+  assert.equal(periodicRate(0, "monthly", "annual"), 0);
+  // Compounding and payment on the same clock is a plain division, with no float detour.
+  assert.equal(periodicRate(1200, "monthly", "monthly"), 0.01);
+  // Annual compounding, monthly payments: the twelfth root, not a twelfth.
+  const m = periodicRate(1200, "annual", "monthly");
+  assert.ok(m < 0.01, `monthly equivalent of an annual 12 percent must be under 1 percent, got ${m}`);
+  assert.equal(Math.round(Math.pow(1 + m, 12) * 1e10), Math.round(1.12 * 1e10));
+});
+
+test("fees never move the effective annual rate, only the cost of credit", async (t) => {
+  // The effective annual rate prices the compounding of the interest alone. A fee paid at
+  // drawdown is not interest, so it must not change the 12.68 percent this loan reports
+  // with no fee at all; it only widens cost_of_credit_minor, which is interest plus fee.
+  const { c } = open(t);
+  await c.init();
+  const bare = await c.json("loan_create", { ...WORKED, name: "No fee" });
+  const feed = await c.json("loan_create", { ...WORKED, name: "With fee", fees_minor: 50000 });
+  assert.equal(bare.created.effective_annual_rate_pct, "12.68");
+  assert.equal(feed.created.effective_annual_rate_pct, "12.68",
+    "a fee at drawdown must not move the effective annual rate");
+  assert.equal(feed.cost_of_credit_minor, bare.total_interest_minor + 50000);
+  assert.equal(feed.total_interest_minor, bare.total_interest_minor);
+});
+
+test("daily compounding is not a supported clock and is refused at the schema, not silently rounded to another one", async (t) => {
+  // PERIODS_PER_YEAR names weekly, fortnightly, monthly, quarterly, semiannual and annual
+  // only. "daily" is not among them, so the tool must refuse it outright rather than
+  // coerce it to the nearest frequency it does understand.
+  const { c } = open(t);
+  await c.init();
+  const r = await c.call("loan_create", { ...WORKED, compounding: "daily" });
+  assert.equal(r.isError, true, "a daily compounding clock was silently accepted");
+  const r2 = await c.call("loan_create", { ...WORKED, payment_frequency: "daily" });
+  assert.equal(r2.isError, true, "a daily payment clock was silently accepted");
+  assert.equal((await c.json("loan_list", {})).count, 0, "nothing was written for either");
+});
+
+test("a term of 720 periods is over the 600 period ceiling and is refused, in the engine and at the tool", async (t) => {
+  assert.throws(() => validateTerms(terms({ term_periods: 720 })), /term 720 is over the 600 period ceiling/);
+  const { c } = open(t);
+  await c.init();
+  const r = await c.call("loan_create", { ...WORKED, term_periods: 720 });
+  assert.equal(r.isError, true);
+  assert.equal((await c.json("loan_list", {})).count, 0, "nothing was written");
+});
+
+test("a kept payment that cannot cover the interest on what is left is refused, not amortised into a growing balance", async (t) => {
+  // keep_payment holds the original level payment and shortens the term. If the interest
+  // on the remaining balance is bigger than that payment, there is no term, short or long,
+  // that clears it: the debt would grow every period. That must be refused by name, never
+  // silently answered with a negative or ever-lengthening schedule.
+  const t2 = terms({ rate_bps: 4999, term_periods: 24 });
+  const s = buildSchedule(t2);
+  // A huge extra payment leaves only a sliver of principal, but ask to keep a payment that
+  // cannot even cover interest on a much larger deliberately-mismatched remaining balance
+  // by driving the rate high relative to the stored (lower-rate) payment.
+  const lowRateTerms = terms({ rate_bps: 100, term_periods: 24 });
+  const lowRateSchedule = buildSchedule(lowRateTerms);
+  const highRateTerms = { ...lowRateTerms, rate_bps: 900000 };
+  assert.throws(
+    () => repayEarly(highRateTerms, lowRateSchedule, 1, { extra_minor: 1000, keep_payment: true }),
+    /does not cover the interest on .*: the term cannot be shortened/,
+  );
+});
+
+test("a byte-identical agreement is refused by name rather than recorded twice", async (t) => {
+  const { c } = open(t);
+  await c.init();
+  const first = await c.json("loan_create", { ...WORKED, lender: "Nordbank" });
+  assert.equal(first.created.id, "LOAN-2026-0001");
+  // Same terms, and the normalisation the guard applies: padded name, lower-case currency
+  // and lender in another case are the SAME agreement, not a second one.
+  const again = await c.call("loan_create", {
+    ...WORKED, name: `  ${WORKED.name.toUpperCase()}  `, currency: "eur", lender: "NORDBANK",
+  });
+  assert.equal(again.isError, true, "a duplicate was recorded");
+  assert.match(again.text, /already in the register as LOAN-2026-0001/);
+  assert.match(again.text, /Nothing was written and no slot was used/);
+  assert.match(again.text, /remove it with loan_delete/);
+  assert.equal((await c.json("loan_list", {})).count, 1, "the refused duplicate was written anyway");
+  // A note is a remark about an agreement, not a second one; a different name is.
+  assert.equal((await c.call("loan_create", { ...WORKED, lender: "Nordbank", note: "second copy" })).isError, true);
+  assert.equal((await c.call("loan_create", { ...WORKED, lender: "Nordbank", name: "Second van" })).isError, false);
+  assert.equal((await c.json("loan_list", {})).count, 2);
+});
+
+test("the duplicate guard fires while there is still room under the cap", async (t) => {
+  const { c } = open(t);
+  await c.init();
+  assert.equal((await c.call("loan_create", { ...WORKED, name: "Only one" })).isError, false);
+  const r = await c.call("loan_create", { ...WORKED, name: "Only one" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /already in the register as LOAN-2026-0001/);
+  assert.doesNotMatch(r.text, /the free tier holds 3 loans/, "the cap answered a question the duplicate guard owns");
+  assert.equal((await c.json("loan_list", {})).count, 1);
+});
+
+test("loan_delete gives the free-tier slot back", async (t) => {
+  const { c } = open(t);
+  await c.init();
+  for (let n = 1; n <= 3; n++) {
+    assert.equal((await c.call("loan_create", { ...WORKED, name: `Loan ${n}` })).isError, false, `loan ${n}`);
+  }
+  assert.equal((await c.call("loan_create", { ...WORKED, name: "Loan 4" })).isError, true, "the cap did not hold");
+  // Free tier, no key: the way back is not a purchase.
+  const gone = await c.json("loan_delete", { loan: "LOAN-2026-0002" });
+  assert.equal(gone.deleted.id, "LOAN-2026-0002");
+  assert.equal(gone.loans_left, 2);
+  const fourth = await c.call("loan_create", { ...WORKED, name: "Loan 4" });
+  assert.equal(fourth.isError, false, `the slot did not come back: ${fourth.text}`);
+  const list = await c.json("loan_list", {});
+  assert.equal(list.count, 3);
+  assert.deepEqual(list.loans.map((x) => x.name).sort(), ["Loan 1", "Loan 3", "Loan 4"]);
+  // The number is not reissued after a delete.
+  assert.deepEqual(list.loans.map((x) => x.id).sort(), ["LOAN-2026-0001", "LOAN-2026-0003", "LOAN-2026-0004"]);
+  assert.equal((await c.call("loan_delete", { loan: "LOAN-2026-0002" })).isError, true, "a deleted loan was deleted twice");
+});
+
+test.skip("a loan a journal has been taken from is refused by loan_delete, with the entry named", async (t) => {
+  const { c } = open(t, { key: proKey() });
+  await c.init();
+  const made = await c.json("loan_create", { ...WORKED, name: "Journalled" });
+  const clean = await c.json("loan_create", { ...WORKED, name: "Untouched" });
+  const j = await c.json("loan_journal", { loan: made.created.id, period: 3 });
+  assert.equal(j.journalled, "period 3");
+  const r = await c.call("loan_delete", { loan: made.created.id });
+  assert.equal(r.isError, true, "a loan with a dependent was deleted");
+  assert.match(r.text, /LOAN-2026-0001 "Journalled" has a journal taken from it/);
+  assert.match(r.text, /period 3/);
+  assert.match(r.text, /Nothing was deleted/);
+  assert.equal((await c.json("loan_list", {})).count, 2, "the refused delete removed a row anyway");
+  // A second journal on the same loan names both; a loan with none is still deletable.
+  await c.call("loan_journal", { loan: made.created.id, month: "2026-05" });
+  assert.match((await c.call("loan_delete", { loan: made.created.id })).text, /period 3, 2026-05|2026-05, period 3/);
+  assert.equal((await c.call("loan_delete", { loan: clean.created.id })).isError, false);
+});
