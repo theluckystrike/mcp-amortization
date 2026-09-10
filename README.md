@@ -1,13 +1,45 @@
 # mcp-amortization
 
+<!-- mirror-seo:start -->
+
+**MCP server for loan and lease amortization schedules.** Loan and lease schedules from the terms of the agreement, to the minor unit.
+
+Works with Claude Desktop, Claude Code, Cursor and any Model Context Protocol client. Runs on your own machine, or hosted with no install.
+
+## Install
+
+**Hosted, nothing to install.** Point an MCP client at `https://mcp.zovo.one/mcp/amortization` over streamable-http and send `Authorization: Bearer <token>`, where the token is a Pro key or a free anonymous one from <https://mcp.zovo.one/mcp/token>.
+
+**Claude Desktop, one click.** Download `amortization.mcpb` from the [latest release](https://github.com/theluckystrike/mcp-servers/releases/latest) and double-click it.
+
+**From source.** The mirror is self-contained: every `@theluckystrike/*` dependency is vendored, so a fresh clone builds with no extra setup.
+
+```sh
+git clone https://github.com/theluckystrike/mcp-amortization.git
+cd mcp-amortization
+npm install && npm run build
+```
+
+Then point your client at the built entry point:
+
+```json
+{
+  "mcpServers": {
+    "amortization": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-amortization/dist/index.js"]
+    }
+  }
+}
+```
+
+> `@theluckystrike/mcp-amortization` is **not published on npm yet**, so an `npx -y @theluckystrike/mcp-amortization` command will fail. The three paths above are the working ones and each is exercised by CI.
+
 ![amortization demo](https://raw.githubusercontent.com/theluckystrike/mcp-servers/main/assets/demo-amortization.gif)
-
-**One-click install:** download `amortization.mcpb` from the [latest release](https://github.com/theluckystrike/mcp-servers/releases/latest) and double-click it in Claude Desktop.
-
-**Hosted endpoint (no install):** `https://mcp.zovo.one/mcp/amortization` (streamable-http; send `Authorization: Bearer <Pro key or anonymous token from https://mcp.zovo.one/mcp/token>`).
 
 Read-only mirror of [mcp-servers/servers/amortization](https://github.com/theluckystrike/mcp-servers/tree/main/servers/amortization). See [MIRROR.md](MIRROR.md).
 
+<!-- mirror-seo:end -->
 
 Loan and lease schedules for an AI assistant. Give it the terms of a credit agreement -- the amount, the nominal annual rate in basis points, how often interest compounds, how often a payment falls due, the term in periods, the method, any arrangement fee and any balloon -- and it works out the payment, the effective annual rate, and the schedule period by period: opening balance, payment, interest, principal, closing balance. It answers what settling early would cost and save, and hands back the double entry for a payment in the same account names the cash book uses. Everything is integer minor units, and every closing balance reaches the balloon, or zero, exactly. Nothing is sent anywhere: the register is a file on your machine.
 
